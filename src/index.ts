@@ -140,7 +140,7 @@ app.get('/agents/:key', (c) => {
     key: profile.key,
     displayName: profile.displayName,
     visibility: profile.visibility,
-    tools: Object.keys(profile.toolScope.coreTools),
+    tools: profile.toolScope.coreTools,
   });
 });
 
