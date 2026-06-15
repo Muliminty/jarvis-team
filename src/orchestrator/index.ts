@@ -9,6 +9,7 @@ import type {
   TaskStatus,
   TaskType,
   CoordinationMode,
+  AgentKey,
   StepType,
   StepStatus,
 } from '../shared/types.js';
@@ -90,26 +91,25 @@ function extractTextContent(event: InternalEvent): string {
 // 将任务拆解为步骤 — PM Agent 的核心能力
 // 当前为规则版，后续替换为 LLM 驱动
 export function planSteps(taskType: TaskType): Omit<TaskStep, 'id' | 'taskId' | 'status' | 'input' | 'output' | 'startedAt' | 'finishedAt'>[] {
+  // v1: 仅 3 个 Agent（secretary/reviewer/orchestrator），pm/research/worker/qa-risk 留 Phase 2
   switch (taskType) {
     case 'project':
       return [
-        { stepType: 'plan', assignedAgent: 'pm', dependsOn: [] },
-        { stepType: 'research', assignedAgent: 'research', dependsOn: ['step-0'] },
-        { stepType: 'execute', assignedAgent: 'worker', dependsOn: ['step-1'] },
-        { stepType: 'review', assignedAgent: 'qa-risk', dependsOn: ['step-2'] },
-        { stepType: 'report', assignedAgent: 'secretary', dependsOn: ['step-3'] },
+        { stepType: 'plan', assignedAgent: 'secretary', dependsOn: [] },
+        { stepType: 'execute', assignedAgent: 'secretary', dependsOn: ['step-0'] },
+        { stepType: 'review', assignedAgent: 'reviewer', dependsOn: ['step-1'] },
+        { stepType: 'report', assignedAgent: 'secretary', dependsOn: ['step-2'] },
       ];
     case 'summarize':
       return [
-        { stepType: 'research', assignedAgent: 'research', dependsOn: [] },
-        { stepType: 'execute', assignedAgent: 'worker', dependsOn: ['step-0'] },
-        { stepType: 'review', assignedAgent: 'qa-risk', dependsOn: ['step-1'] },
-        { stepType: 'report', assignedAgent: 'secretary', dependsOn: ['step-2'] },
+        { stepType: 'execute', assignedAgent: 'secretary', dependsOn: [] },
+        { stepType: 'review', assignedAgent: 'reviewer', dependsOn: ['step-0'] },
+        { stepType: 'report', assignedAgent: 'secretary', dependsOn: ['step-1'] },
       ];
     case 'execute':
       return [
-        { stepType: 'execute', assignedAgent: 'worker', dependsOn: [] },
-        { stepType: 'review', assignedAgent: 'qa-risk', dependsOn: ['step-0'] },
+        { stepType: 'execute', assignedAgent: 'secretary', dependsOn: [] },
+        { stepType: 'review', assignedAgent: 'reviewer', dependsOn: ['step-0'] },
         { stepType: 'report', assignedAgent: 'secretary', dependsOn: ['step-1'] },
       ];
     default:
@@ -134,15 +134,15 @@ export function checkFuses(
   if (task.tokenUsed !== undefined && task.tokenUsed >= config.maxTokensPerTask) {
     return { tripped: true, reason: `超过 Token 预算 ${config.maxTokensPerTask}` };
   }
-  // 审批超时
-  if (task.status === 'waiting_approval' && task.lastApprovalAt) {
+  // 审批超时：drafted 状态下等待 reviewer 审批
+  if (task.status === 'drafted' && task.lastApprovalAt) {
     const elapsed = now - task.lastApprovalAt.getTime();
     if (elapsed > config.approvalTimeoutMs) {
       return { tripped: true, reason: '审批等待超时' };
     }
   }
-  // Agent 空闲超时
-  if (task.status === 'running' && task.lastActivityAt) {
+  // Agent 空闲超时：正在执行的任务长时间无活动
+  if ((task.status === 'planned' || task.status === 'clarifying') && task.lastActivityAt) {
     const elapsed = now - task.lastActivityAt.getTime();
     if (elapsed > config.agentIdleTimeoutMs) {
       return { tripped: true, reason: 'Agent 空闲超时' };

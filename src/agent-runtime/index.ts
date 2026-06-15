@@ -93,38 +93,11 @@ export const AGENT_PROFILES: Record<AgentKey, AgentProfile> = {
       },
     ],
   },
-  pm: {
-    key: 'pm',
-    displayName: 'PM',
-    voiceStyle: '结构化、明确、带流程感。',
-    visibility: 'frontstage',
-    speakRules: {
-      canInitiate: false,
-      triggers: ['blocked'],
-      cooldownMs: 30_000,
-      canMentionUser: true,
-    },
-    toolScope: {
-      coreTools: ['search_docs', 'fetch_memory_context'],
-      stageTools: {
-        planning: ['tool_search'],
-        review: ['tool_search'],
-      },
-      discoverableTools: ['tool_search'],
-      approvalRequired: [],
-    },
-    promptModules: [
-      {
-        name: 'pm-core',
-        priority: 0,
-        content: '你是项目经理，负责把模糊需求拆成结构化任务，标记依赖和优先级，发现范围蔓延。',
-      },
-    ],
-  },
-  'qa-risk': {
-    key: 'qa-risk',
-    displayName: '风控',
-    voiceStyle: '克制、直接、不频繁发言。',
+  // Phase 2 Agent: pm, qa-risk, research, worker — 待 v2 启用
+  reviewer: {
+    key: 'reviewer',
+    displayName: '复核员',
+    voiceStyle: '审慎、精确、从风险角度思考。',
     visibility: 'frontstage',
     speakRules: {
       canInitiate: false,
@@ -142,59 +115,9 @@ export const AGENT_PROFILES: Record<AgentKey, AgentProfile> = {
     },
     promptModules: [
       {
-        name: 'qa-core',
+        name: 'reviewer-core',
         priority: 0,
-        content: '你是风控/复核官，负责发现风险、挑出冲突、阻止越权、在低置信度时要求人工确认。默认沉默，仅在风险事件下发言。',
-      },
-    ],
-  },
-  research: {
-    key: 'research',
-    displayName: '调研',
-    voiceStyle: '后台角色，不前台发言。',
-    visibility: 'backstage',
-    speakRules: {
-      canInitiate: false,
-      triggers: [],
-      cooldownMs: 0,
-      canMentionUser: false,
-    },
-    toolScope: {
-      coreTools: ['search_docs', 'tool_search', 'fetch_memory_context'],
-      stageTools: {},
-      discoverableTools: ['tool_search'],
-      approvalRequired: [],
-    },
-    promptModules: [
-      {
-        name: 'research-core',
-        priority: 0,
-        content: '你是调研 Agent，负责搜索文档、知识库、历史项目和外部资料。将结果以结构化摘要返回。',
-      },
-    ],
-  },
-  worker: {
-    key: 'worker',
-    displayName: '执行',
-    voiceStyle: '后台角色，不前台发言。',
-    visibility: 'backstage',
-    speakRules: {
-      canInitiate: false,
-      triggers: [],
-      cooldownMs: 0,
-      canMentionUser: false,
-    },
-    toolScope: {
-      coreTools: ['create_doc', 'append_doc_block', 'update_bitable_record', 'create_calendar_event'],
-      stageTools: {},
-      discoverableTools: ['tool_search'],
-      approvalRequired: ['create_doc', 'update_bitable_record', 'create_calendar_event'],
-    },
-    promptModules: [
-      {
-        name: 'worker-core',
-        priority: 0,
-        content: '你是执行 Agent，负责写文档、写表格、整理草稿、生成初版输出。执行写操作前必须经过审批。',
+        content: '你是复核员，负责检查 Secretary 的输出质量、发现潜在风险和问题、在低置信度时要求人工确认。默认沉默，仅在发现问题时发言。',
       },
     ],
   },
