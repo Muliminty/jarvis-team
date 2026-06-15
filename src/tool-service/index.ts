@@ -15,7 +15,7 @@
 
 import { z } from 'zod';
 import { createHash } from 'node:crypto';
-import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -609,8 +609,199 @@ function setupBuiltinTools(): void {
   });
 }
 
-// 启动时注册内置工具
+// ──────────────────────────────────────────
+// 管理工具 - Agent CRUD
+// ──────────────────────────────────────────
+
+const AGENTS_DIR = join(process.cwd(), 'agents');
+
+function setupManagementTools(): void {
+  registerTool({
+    name: 'list_agents',
+    description: '列出所有已注册的 Agent/Bot。返回每个 Agent 的 ID 和显示名。',
+    paramsSchema: {},
+    requiresApproval: false,
+    riskLevel: 'low',
+    readOnly: true,
+    handler: async () => {
+      if (!existsSync(AGENTS_DIR)) {
+        return { success: true, output: '暂无 Agent。使用 create_agent 创建一个。' };
+      }
+      const agents = readdirSync(AGENTS_DIR)
+        .filter(f => f.endsWith('.json'))
+        .map(f => f.replace(/\.json$/, ''));
+      if (agents.length === 0) {
+        return { success: true, output: '暂无 Agent。使用 create_agent 创建一个。' };
+      }
+      const lines = agents.map(id => {
+        try {
+          const raw = readFileSync(join(AGENTS_DIR, `${id}.json`), 'utf-8');
+          const cfg = JSON.parse(raw);
+          return `- ${id}: ${cfg.displayName ?? '未知'}${cfg.description ? ` — ${cfg.description}` : ''}`;
+        } catch {
+          return `- ${id}: (读取失败)`;
+        }
+      });
+      return { success: true, output: `已注册 ${agents.length} 个 Agent:\n${lines.join('\n')}` };
+    },
+  });
+
+  registerTool({
+    name: 'create_agent',
+    description: '创建新的 Agent/Bot。当用户说"创建一个新 Bot/机器人/Agent/助手"时调用。需要用户提供名称和角色描述。',
+    paramsSchema: {
+      name: { schema: z.string().min(1).max(32), description: 'Bot 名称，如"数据观察员"', required: true },
+      description: { schema: z.string().min(1).max(500), description: 'Bot 的角色描述，用户说了什么、这个 Bot 负责什么', required: true },
+      voiceStyle: { schema: z.string().max(200).optional(), description: '语气风格（可选），如"数据驱动、只给量化结论"', required: false },
+    },
+    requiresApproval: true,
+    riskLevel: 'high',
+    readOnly: false,
+    handler: async (params) => {
+      const name = String(params['name']);
+      const description = String(params['description']);
+      const voiceStyle = params['voiceStyle'] ? String(params['voiceStyle']) : '';
+      const agentId = name.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-').replace(/^-|-$/g, '') || 'agent';
+
+      // 检查是否已存在
+      const filePath = join(AGENTS_DIR, `${agentId}.json`);
+      if (existsSync(filePath)) {
+        return { success: false, output: `Agent "${name}" (${agentId}) 已存在。如需修改请用 edit_agent 工具。` };
+      }
+
+      // 构造配置
+      const corePrompt = `你是 ${name}。${description}`;
+      const config = {
+        id: agentId,
+        displayName: name,
+        description,
+        persona: {
+          corePrompt,
+          voiceStyle: voiceStyle || '默认',
+        },
+        toolScope: {
+          coreTools: ['search_docs', 'send_group_message', 'fetch_memory_context', 'tool_search'],
+          stageTools: {},
+          approvalRequired: ['create_doc', 'send_card'],
+        },
+        speakRules: {
+          canInitiate: false,
+          triggers: ['result_ready'],
+          cooldownMs: 30000,
+        },
+      };
+
+      if (!existsSync(AGENTS_DIR)) {
+        mkdirSync(AGENTS_DIR, { recursive: true });
+      }
+      writeFileSync(filePath, JSON.stringify(config, null, 2), 'utf-8');
+
+      return {
+        success: true,
+        output: [
+          `✅ 已创建 Agent: ${name} (${agentId})`,
+          '',
+          '接下来：',
+          '1. 去飞书开发者后台注册这个 Bot → https://open.feishu.cn/app',
+          '2. 注册后把 App ID 和 App Secret 发给我',
+          '3. 我会帮你绑定，之后就能用了',
+          '',
+          '如需修改人设或配置，随时告诉我。',
+        ].join('\n'),
+      };
+    },
+  });
+
+  registerTool({
+    name: 'edit_agent',
+    description: '修改已有 Agent 的配置。只填需要改的字段，不填的字段保持不变。',
+    paramsSchema: {
+      agentId: { schema: z.string(), description: '要修改的 Agent ID', required: true },
+      displayName: { schema: z.string().max(32).optional(), description: '新的显示名称', required: false },
+      corePrompt: { schema: z.string().max(2000).optional(), description: '新的角色定义 System Prompt', required: false },
+      voiceStyle: { schema: z.string().max(200).optional(), description: '新的语气风格', required: false },
+      description: { schema: z.string().max(500).optional(), description: '新的简短描述', required: false },
+    },
+    requiresApproval: false,
+    riskLevel: 'medium',
+    readOnly: false,
+    handler: async (params) => {
+      const agentId = String(params['agentId']);
+      const filePath = join(AGENTS_DIR, `${agentId}.json`);
+      if (!existsSync(filePath)) {
+        return { success: false, output: `Agent "${agentId}" 不存在。使用 create_agent 创建。` };
+      }
+
+      const config = JSON.parse(readFileSync(filePath, 'utf-8'));
+
+      // 只覆盖传了的字段
+      if (params['displayName']) config.displayName = params['displayName'];
+      if (params['corePrompt']) config.persona.corePrompt = params['corePrompt'];
+      if (params['voiceStyle']) config.persona.voiceStyle = params['voiceStyle'];
+      if (params['description']) config.description = params['description'];
+
+      writeFileSync(filePath, JSON.stringify(config, null, 2), 'utf-8');
+
+      return { success: true, output: `✅ 已更新 Agent: ${agentId}\n下次对话生效。` };
+    },
+  });
+
+  registerTool({
+    name: 'delete_agent',
+    description: '删除一个 Agent。删除后无法恢复。注意不能删除 assistant（默认助手）。',
+    paramsSchema: {
+      agentId: { schema: z.string(), description: '要删除的 Agent ID', required: true },
+    },
+    requiresApproval: true,
+    riskLevel: 'high',
+    readOnly: false,
+    handler: async (params) => {
+      const agentId = String(params['agentId']);
+      if (agentId === 'assistant') {
+        return { success: false, output: '不能删除默认助手。你可以用 edit_agent 修改它，或先创建一个新的 Agent 替代它。' };
+      }
+      const filePath = join(AGENTS_DIR, `${agentId}.json`);
+      if (!existsSync(filePath)) {
+        return { success: false, output: `Agent "${agentId}" 不存在。` };
+      }
+      rmSync(filePath);
+      return { success: true, output: `✅ 已删除 Agent: ${agentId}` };
+    },
+  });
+
+  registerTool({
+    name: 'bind_agent_credentials',
+    description: '将飞书 Bot 凭证绑定到 Agent。用户在飞书开发者后台注册 Bot 后，把 App ID 和 App Secret 发过来时调用。',
+    paramsSchema: {
+      agentId: { schema: z.string(), description: '要绑定凭证的 Agent ID', required: true },
+      appId: { schema: z.string(), description: '飞书 Bot 的 App ID', required: true },
+      appSecret: { schema: z.string(), description: '飞书 Bot 的 App Secret', required: true },
+      verificationToken: { schema: z.string().optional(), description: '飞书 Bot 的 Verification Token', required: false },
+    },
+    requiresApproval: true,
+    riskLevel: 'high',
+    readOnly: false,
+    handler: async (params) => {
+      const agentId = String(params['agentId']);
+      const filePath = join(AGENTS_DIR, `${agentId}.json`);
+      if (!existsSync(filePath)) {
+        return { success: false, output: `Agent "${agentId}" 不存在。请先创建。` };
+      }
+      const config = JSON.parse(readFileSync(filePath, 'utf-8'));
+      config.feishuBot = {
+        appId: String(params['appId']),
+        appSecret: String(params['appSecret']),
+        verificationToken: params['verificationToken'] ? String(params['verificationToken']) : '',
+      };
+      writeFileSync(filePath, JSON.stringify(config, null, 2), 'utf-8');
+      return { success: true, output: `✅ 已绑定！${config.displayName ?? agentId} 现在可以接收消息了。\n请把它拉进群，然后就可以 @${config.displayName ?? agentId} 跟它对话。` };
+    },
+  });
+}
+
+// 启动时注册
 setupBuiltinTools();
+setupManagementTools();
 
 // ──────────────────────────────────────────
 // 导出 Anthropic Tool 格式

@@ -1,61 +1,83 @@
 // Agent 运行时 — 对应技术架构 2.3 节
-// 职责：承载各角色 Prompt、工具权限、输出协议，
-// 通过 Prompt Pipe 组装角色上下文，按 Tool Policy 动态暴露工具
+// 职责：加载 Agent 配置、组装 System Prompt、管理工具可见性
 //
-// 设计思路：每个 Agent 角色不是独立的微服务，而是"角色化 Prompt + 工具权限"的组合。
-// Prompt Pipe 把角色 Prompt 拆成可组合的模块，避免长字符串硬编码，也方便
-// 后续按上下文动态裁剪。
+// 设计思路：Agent 配置存储在 agents/*.json 文件中，支持动态创建和修改。
+// 没有内置角色——所有 Agent 平等，包括默认的 assistant。
 
-import type { AgentKey, Visibility, SpeakState, SpeakEventType } from '../shared/types.js';
+import { readFileSync, readdirSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import type { Visibility, SpeakEventType } from '../shared/types.js';
 
-// Agent 角色定义 — 对应飞书落地 2.x 节各 Bot 人设
+// ──────────────────────────────────────────
+// Agent 配置文件目录
+// ──────────────────────────────────────────
+
+export const AGENTS_DIR = join(process.cwd(), 'agents');
+
+// ──────────────────────────────────────────
+// JSON 配置格式（用户友好，文件存储用）
+// ──────────────────────────────────────────
+
+export interface AgentConfig {
+  id: string;
+  displayName: string;
+  description?: string;
+  feishuBot?: {
+    appId: string;
+    appSecret: string;
+    verificationToken: string;
+  };
+  persona: {
+    corePrompt: string;
+    voiceStyle?: string;
+  };
+  toolScope: {
+    coreTools: string[];
+    stageTools?: Record<string, string[]>;
+    approvalRequired?: string[];
+  };
+  speakRules: {
+    canInitiate: boolean;
+    triggers: string[];
+    cooldownMs: number;
+  };
+}
+
+// ──────────────────────────────────────────
+// 运行时 Agent Profile（与工具环交互用）
+// ──────────────────────────────────────────
+
 export interface AgentProfile {
-  key: AgentKey;
+  key: string;
   displayName: string;
   voiceStyle: string;
   visibility: Visibility;
   speakRules: SpeakRules;
   toolScope: ToolPolicy;
-  // 角色 System Prompt 由多个 Pipe 模块拼接
   promptModules: PromptModule[];
 }
 
 export interface SpeakRules {
-  // 该角色是否可主动发言
   canInitiate: boolean;
-  // 触发发言的事件类型
   triggers: SpeakEventType[];
-  // 同一任务冷却期 (ms)
   cooldownMs: number;
-  // 是否可直接 @ 用户
   canMentionUser: boolean;
 }
 
-// Tool Policy — 对应技术架构 2.4.1 节
-// 每个角色不直接拥有全部飞书能力，而是按阶段动态暴露
 export interface ToolPolicy {
-  // 核心常驻工具（始终可见）
   coreTools: string[];
-  // 按任务阶段可见的工具
   stageTools: Record<string, string[]>;
-  // 通过 tool_search 延迟发现的工具
   discoverableTools: string[];
-  // 需要二次审批的工具
   approvalRequired: string[];
 }
 
-// Prompt Pipe 模块 — 可组合的 Prompt 片段
 export interface PromptModule {
   name: string;
-  // 优先级：数字越小越靠前
   priority: number;
-  // 该模块在什么条件下注入
   condition?: (ctx: AgentContext) => boolean;
-  // Prompt 内容
   content: string;
 }
 
-// Agent 执行上下文
 export interface AgentContext {
   taskType: string;
   currentStep: string;
@@ -64,91 +86,76 @@ export interface AgentContext {
   activeTools: string[];
 }
 
-// 预定义角色
-export const AGENT_PROFILES: Record<AgentKey, AgentProfile> = {
-  secretary: {
-    key: 'secretary',
-    displayName: '秘书',
-    voiceStyle: '稳定、简洁、像执行秘书。不输出长推理，优先给结论和下一步。',
-    visibility: 'frontstage',
-    speakRules: {
-      canInitiate: true,
-      triggers: ['result_ready', 'approval_needed', 'blocked'],
-      cooldownMs: 10_000,
-      canMentionUser: true,
-    },
-    toolScope: {
-      coreTools: ['send_group_message', 'send_card', 'fetch_memory_context'],
-      stageTools: {
-        reporting: ['search_docs', 'tool_search'],
-      },
-      discoverableTools: ['create_doc', 'update_bitable_record'],
-      approvalRequired: ['create_doc', 'send_card'],
-    },
-    promptModules: [
-      {
-        name: 'secretary-core',
-        priority: 0,
-        content: '你是执行秘书，负责接需求、做总结、发纪要、发提醒、向用户索要决策。',
-      },
-    ],
-  },
-  // Phase 2 Agent: pm, qa-risk, research, worker — 待 v2 启用
-  reviewer: {
-    key: 'reviewer',
-    displayName: '复核员',
-    voiceStyle: '审慎、精确、从风险角度思考。',
-    visibility: 'frontstage',
-    speakRules: {
-      canInitiate: false,
-      triggers: ['risk_detected', 'approval_needed'],
-      cooldownMs: 60_000,
-      canMentionUser: true,
-    },
-    toolScope: {
-      coreTools: ['search_docs', 'fetch_memory_context'],
-      stageTools: {
-        review: ['tool_search'],
-      },
-      discoverableTools: [],
-      approvalRequired: [],
-    },
-    promptModules: [
-      {
-        name: 'reviewer-core',
-        priority: 0,
-        content: '你是复核员，负责检查 Secretary 的输出质量、发现潜在风险和问题、在低置信度时要求人工确认。默认沉默，仅在发现问题时发言。',
-      },
-    ],
-  },
-  orchestrator: {
-    key: 'orchestrator',
-    displayName: '调度器',
-    voiceStyle: '纯后台，不与用户交互。',
-    visibility: 'backstage',
-    speakRules: {
-      canInitiate: false,
-      triggers: [],
-      cooldownMs: 0,
-      canMentionUser: false,
-    },
-    toolScope: {
-      coreTools: [],
-      stageTools: {},
-      discoverableTools: [],
-      approvalRequired: [],
-    },
-    promptModules: [
-      {
-        name: 'orch-core',
-        priority: 0,
-        content: '你是调度器，负责意图识别、任务拆解、Agent 路由、状态管理。不直接出现在群聊中。',
-      },
-    ],
-  },
-};
+// ──────────────────────────────────────────
+// 加载 Agent
+// ──────────────────────────────────────────
 
-// 组装角色 System Prompt — Prompt Pipe 核心逻辑
+/** 加载一个 Agent 的配置文件 */
+export function loadAgent(id: string): AgentProfile | null {
+  const path = join(AGENTS_DIR, `${id}.json`);
+  if (!existsSync(path)) return null;
+  try {
+    const raw = readFileSync(path, 'utf-8');
+    const config: AgentConfig = JSON.parse(raw);
+    return configToProfile(config);
+  } catch {
+    return null;
+  }
+}
+
+/** 加载 Agent 的原始 JSON 配置（供管理工具读写） */
+export function loadAgentConfig(id: string): AgentConfig | null {
+  const path = join(AGENTS_DIR, `${id}.json`);
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/** 列出所有已注册的 Agent ID */
+export function listAgents(): string[] {
+  if (!existsSync(AGENTS_DIR)) return [];
+  return readdirSync(AGENTS_DIR)
+    .filter(f => f.endsWith('.json'))
+    .map(f => f.replace(/\.json$/, ''))
+    .sort();
+}
+
+/** 将用户友好的 JSON 配置转为运行时 AgentProfile */
+function configToProfile(config: AgentConfig): AgentProfile {
+  return {
+    key: config.id,
+    displayName: config.displayName,
+    voiceStyle: config.persona.voiceStyle ?? '默认',
+    visibility: 'frontstage',
+    speakRules: {
+      canInitiate: config.speakRules.canInitiate,
+      triggers: config.speakRules.triggers as SpeakEventType[],
+      cooldownMs: config.speakRules.cooldownMs,
+      canMentionUser: true,
+    },
+    toolScope: {
+      coreTools: config.toolScope.coreTools,
+      stageTools: config.toolScope.stageTools ?? {},
+      discoverableTools: [],
+      approvalRequired: config.toolScope.approvalRequired ?? [],
+    },
+    promptModules: [
+      {
+        name: 'core',
+        priority: 0,
+        content: config.persona.corePrompt,
+      },
+    ],
+  };
+}
+
+// ──────────────────────────────────────────
+// System Prompt 组装
+// ──────────────────────────────────────────
+
 export function assembleSystemPrompt(
   profile: AgentProfile,
   ctx: AgentContext,
@@ -159,31 +166,19 @@ export function assembleSystemPrompt(
 
   const parts: string[] = [];
 
-  // 1. 角色定义
   parts.push(modules.map(m => m.content).join('\n'));
-
-  // 2. 语气设定
   parts.push(`语气：${profile.voiceStyle}`);
-
-  // 3. 当前可用工具
   parts.push(`可用工具：${ctx.activeTools.join(', ')}`);
 
-  // 4. 发言规则
   const rules = profile.speakRules;
   parts.push(`发言规则：${rules.canInitiate ? '可主动发言' : '仅在触发条件下发言'}。触发条件：${rules.triggers.join(', ') || '无主动触发'}`);
 
-  // 5. 当前上下文
-  if (ctx.sessionSummary) {
-    parts.push(`会话摘要：${ctx.sessionSummary}`);
-  }
-  if (ctx.relevantMemories?.length) {
-    parts.push(`相关记忆：${ctx.relevantMemories.join('；')}`);
-  }
+  if (ctx.sessionSummary) parts.push(`会话摘要：${ctx.sessionSummary}`);
+  if (ctx.relevantMemories?.length) parts.push(`相关记忆：${ctx.relevantMemories.join('；')}`);
 
   return parts.join('\n\n');
 }
 
-// 获取当前阶段可见工具列表
 export function getActiveTools(
   profile: AgentProfile,
   stage: string,

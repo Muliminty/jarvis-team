@@ -16,8 +16,8 @@ export type TaskType = 'ask' | 'summarize' | 'project' | 'report' | 'execute';
 // 协作模式 — v1 仅 single-agent，parent-child/swarm 留 Phase 2+
 export type CoordinationMode = 'single-agent' | 'parent-child' | 'light-swarm';
 
-// Agent 角色 — v1 精简为 3 个 (CEO Plan: 移除 v2 角色)
-export type AgentKey = 'secretary' | 'reviewer' | 'orchestrator';
+// Agent 角色 — 可动态创建，不再限制内置角色名
+export type AgentKey = string;
 
 // 飞书回复可见性
 export type Visibility = 'frontstage' | 'backstage';
