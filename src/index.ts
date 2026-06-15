@@ -6,7 +6,7 @@
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { normalizeEvent } from './gateway/index.js';
 import { classifyIntent, planSteps } from './orchestrator/index.js';
@@ -14,6 +14,7 @@ import { loadAgent, listAgents, loadAgentConfig, assembleSystemPrompt, getActive
 import { createTask as createTaskRecord, createStep } from './state-service/index.js';
 import { runAgentLoop, DEFAULT_LOOP_CONFIG } from './agent-loop/index.js';
 import { runToolPipeline, toAnthropicTools } from './tool-service/index.js';
+import { CHAT_PAGE } from './web/index.js';
 
 // ── 启动时确保默认 Agent 存在 ──
 
@@ -23,7 +24,17 @@ function ensureDefaultAgent(): void {
   }
   const defaultPath = join(AGENTS_DIR, 'assistant.json');
   if (!existsSync(defaultPath)) {
+    // 读取 .env 中的飞书凭证（可选）
+    const envFeishuBot = process.env['FEISHU_APP_ID'] && process.env['FEISHU_APP_SECRET']
+      ? {
+          appId: process.env['FEISHU_APP_ID'],
+          appSecret: process.env['FEISHU_APP_SECRET'],
+          verificationToken: process.env['FEISHU_VERIFICATION_TOKEN'] ?? '',
+        }
+      : undefined;
+    if (envFeishuBot) console.log('  Feishu bot credentials found in .env');
     const defaultConfig = {
+      ...(envFeishuBot ? { feishuBot: envFeishuBot } : {}),
       id: 'assistant',
       displayName: '助手',
       description: 'Jarvis Team 默认助手。可完成日常任务，也可创建和管理其他 Agent。',
@@ -176,6 +187,31 @@ app.get('/agents/:id', (c) => {
   });
 });
 
+// ── Web 管理界面 ──
+app.get('/', (c) => c.html(CHAT_PAGE));
+
+// ── 飞书 Bot 凭证绑定（Web 用） ──
+app.post('/api/agents/:id/feishu-bot', async (c) => {
+  const id = c.req.param('id');
+  const body = await c.req.json();
+  const { appId, appSecret, verificationToken } = body;
+
+  if (!appId || !appSecret) {
+    return c.json({ success: false, error: 'appId 和 appSecret 必填' }, 400);
+  }
+
+  const filePath = join(AGENTS_DIR, `${id}.json`);
+  if (!existsSync(filePath)) {
+    return c.json({ success: false, error: `Agent ${id} 不存在` }, 404);
+  }
+
+  const config = JSON.parse(readFileSync(filePath, 'utf-8'));
+  config.feishuBot = { appId, appSecret, verificationToken: verificationToken ?? '' };
+  writeFileSync(filePath, JSON.stringify(config, null, 2), 'utf-8');
+
+  return c.json({ success: true, agentId: id });
+});
+
 // ── 工具列表 ──
 app.get('/api/tools', (c) => {
   const tools = toAnthropicTools();
@@ -185,7 +221,9 @@ app.get('/api/tools', (c) => {
 // ── 启动 ──
 const port = Number(process.env['PORT']) || 3000;
 console.log(`Jarvis Team server starting on port ${port}...`);
+console.log(`  Web UI: http://localhost:${port}`);
 console.log(`  Agents: ${listAgents().join(', ')}`);
 console.log(`  ANTHROPIC_API_KEY: ${process.env['ANTHROPIC_API_KEY'] ? 'set ✓' : 'not set (demo mode)'}`);
+console.log(`  FEISHU_BOT: ${process.env['FEISHU_APP_ID'] ? `set (${process.env['FEISHU_APP_ID']})` : 'not set'}`);
 
 serve({ fetch: app.fetch, port });
