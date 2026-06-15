@@ -1,0 +1,29 @@
+{
+  "name": "jarvis-team",
+  "version": "0.1.0",
+  "private": true,
+  "description": "飞书多Agent协作系统 — 在飞书群聊中构建一个分工明确的 AI 小团队",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.57.0",
+    "hono": "^4.6.0",
+    "zod": "^3.24.0",
+    "drizzle-orm": "^0.40.0",
+    "pg": "^8.13.0",
+    "pino": "^9.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
