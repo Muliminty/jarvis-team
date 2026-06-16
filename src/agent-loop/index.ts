@@ -25,6 +25,8 @@ import type {
 export interface AgentLoopConfig {
   /** Anthropic API Key (默认取 ANTHROPIC_API_KEY 环境变量) */
   apiKey?: string;
+  /** Anthropic API Base URL (默认取 ANTHROPIC_BASE_URL 环境变量，不设则用官方) */
+  baseURL?: string;
   /** 模型名称 */
   model: string;
   /** 单次输出最大 Token */
@@ -40,7 +42,7 @@ export interface AgentLoopConfig {
 }
 
 export const DEFAULT_LOOP_CONFIG: AgentLoopConfig = {
-  model: 'claude-sonnet-4-20250514',
+  model: 'claude-sonnet-4-6',
   maxTokens: 8192,
   maxTurns: 30,
   tokenBudget: 50_000,
@@ -325,7 +327,16 @@ export async function runAgentLoop(
       usage: { turnCount: 0, totalOutputTokens: 0, totalInputTokens: 0 },
     };
   }
-  const client = new Anthropic({ apiKey });
+  const baseURL = config.baseURL ?? process.env['ANTHROPIC_BASE_URL'];
+  // 自定义 fetch：移除 User-Agent 头避免被某些代理的 Cloudflare WAF 拦截
+  const fetchWithoutUA: typeof globalThis.fetch = (url, init) => {
+    const headers = new Headers(init?.headers);
+    headers.delete('user-agent');
+    return globalThis.fetch(url, { ...init, headers });
+  };
+  const client = new Anthropic(baseURL
+    ? { apiKey, baseURL, fetch: fetchWithoutUA }
+    : { apiKey, fetch: fetchWithoutUA });
   const state = createFuseState();
 
   while (true) {

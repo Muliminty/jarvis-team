@@ -18,7 +18,7 @@ interface FeishuEventPayload {
     event_id: string;
     event_type: string;
     create_time: string;
-    token: string;
+    token?: string;
   };
   event?: {
     sender?: { sender_id?: { open_id?: string } };

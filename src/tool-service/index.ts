@@ -15,6 +15,7 @@
 
 import { z } from 'zod';
 import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -65,8 +66,8 @@ export interface ToolDefinition {
   riskLevel: RiskLevel;
   /** 是否只读（只读工具可并发执行） */
   readOnly: boolean;
-  /** 工具处理函数 */
-  handler: (params: Record<string, unknown>) => Promise<ToolHandlerResult>;
+  /** 工具处理函数 — ctx.profile 为 lark-cli profile 名，供飞书工具使用 */
+  handler: (params: Record<string, unknown>, ctx?: { profile: string }) => Promise<ToolHandlerResult>;
 }
 
 /** 工具处理返回 — 统一格式 */
@@ -318,14 +319,81 @@ function matchPermissionRule(pattern: string, toolName: string, command: string)
 const MAX_RESULT_CHARS = 50_000;
 const RESULTS_DIR = join(tmpdir(), 'jarvis-team-tool-results');
 
+// ──────────────────────────────────────────
+// lark-cli 执行封装 — 供飞书工具 handler 使用
+// 设计思路：不直接调飞书 HTTP API，而是 shell out 到 lark-cli，
+// 利用 CLI 内置的 token 刷新、API 版本管理、错误处理。
+// ──────────────────────────────────────────
+
+const CLI_TIMEOUT_MS = 30_000; // 单次 CLI 调用超时
+
+/**
+ * 执行 lark-cli 命令并返回 stdout
+ * @param profile - lark-cli profile 名（对应 Agent ID）
+ * @param args - CLI 参数，如 ['im', '+messages-send', '--chat-id', 'xxx', '--text', 'hello']
+ */
+function execCli(profile: string, args: string[]): Promise<{ success: boolean; output: string }> {
+  return new Promise((resolve) => {
+    const child = spawn('lark-cli', ['--profile', profile, ...args], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: CLI_TIMEOUT_MS,
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve({ success: true, output: stdout.trim() });
+      } else {
+        // 尝试从 stderr 或 stdout 提取 JSON 错误信息
+        const errorDetail = extractCliError(stderr || stdout);
+        resolve({
+          success: false,
+          output: `lark-cli 执行失败 (exit ${code}): ${errorDetail}`,
+        });
+      }
+    });
+
+    child.on('error', (err) => {
+      resolve({
+        success: false,
+        output: `无法启动 lark-cli: ${err.message}。请确认已安装 @larksuite/cli。`,
+      });
+    });
+  });
+}
+
+/** 从 CLI 输出中提取可读的错误信息 */
+function extractCliError(raw: string): string {
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed.error?.message) return parsed.error.message;
+    if (parsed.msg) return parsed.msg;
+    return raw.slice(0, 500);
+  } catch {
+    // 非 JSON，直接截取前 500 字符
+    return raw.slice(0, 500) || '未知错误';
+  }
+}
+
 async function executeAndTruncate(
   tool: ToolDefinition,
   input: Record<string, unknown>,
+  profile?: string,
 ): Promise<ToolHandlerResult> {
   let result: ToolHandlerResult;
 
   try {
-    result = await tool.handler(input);
+    result = await tool.handler(input, profile ? { profile } : undefined);
   } catch (err: unknown) {
     // LLM-friendly 错误 — 课程：错误信息是给模型看的，不是给人看的
     const errorMsg = formatLLMError(tool.name, err);
@@ -400,7 +468,8 @@ export async function runToolPipeline(
   }
 
   // Step 6: 执行 + 结果截断
-  const result = await executeAndTruncate(tool, enrichedInput);
+  // agentKey 即 lark-cli profile 名，供飞书工具 handler 使用
+  const result = await executeAndTruncate(tool, enrichedInput, context.agentKey);
 
   // Step 7: 后置 Hook (预留)
   // TODO: 加载用户自定义 PostToolUse Hook 脚本
@@ -474,12 +543,16 @@ function setupBuiltinTools(): void {
     requiresApproval: false,
     riskLevel: 'medium',
     readOnly: false,
-    handler: async (params) => {
-      // TODO: 接入真实飞书 API
-      return {
-        success: true,
-        output: `[stub] 已向群 ${params['chat_id']} 发送消息`,
-      };
+    handler: async (params, ctx) => {
+      const chatId = String(params['chat_id']);
+      const text = String(params['content']);
+      const profile = ctx?.profile ?? 'assistant';
+      const { success, output } = await execCli(profile, [
+        'im', '+messages-send',
+        '--chat-id', chatId,
+        '--text', text,
+      ]);
+      return { success, output };
     },
   });
 
@@ -493,12 +566,17 @@ function setupBuiltinTools(): void {
     requiresApproval: true,
     riskLevel: 'high',
     readOnly: false,
-    handler: async (params) => {
-      // TODO: 接入真实飞书 API
-      return {
-        success: true,
-        output: `[stub] 已向群 ${params['chat_id']} 发送卡片`,
-      };
+    handler: async (params, ctx) => {
+      const chatId = String(params['chat_id']);
+      const cardJson = JSON.stringify(params['card']);
+      const profile = ctx?.profile ?? 'assistant';
+      const { success, output } = await execCli(profile, [
+        'im', '+messages-send',
+        '--chat-id', chatId,
+        '--msg-type', 'interactive',
+        '--content', cardJson,
+      ]);
+      return { success, output };
     },
   });
 
@@ -512,12 +590,14 @@ function setupBuiltinTools(): void {
     requiresApproval: true,
     riskLevel: 'high',
     readOnly: false,
-    handler: async (params) => {
-      // TODO: 接入真实飞书 API
-      return {
-        success: true,
-        output: `[stub] 已创建文档: ${params['title']}`,
-      };
+    handler: async (params, ctx) => {
+      const title = String(params['title']);
+      const content = params['content'] ? String(params['content']) : undefined;
+      const profile = ctx?.profile ?? 'assistant';
+      const args = ['docs', '+create', '--title', title];
+      if (content) args.push('--content', content);
+      const { success, output } = await execCli(profile, args);
+      return { success, output };
     },
   });
 
@@ -531,12 +611,16 @@ function setupBuiltinTools(): void {
     requiresApproval: false,
     riskLevel: 'low',
     readOnly: true,
-    handler: async (params) => {
-      // TODO: 接入真实飞书 API
-      return {
-        success: true,
-        output: `[stub] 搜索 "${params['query']}" 的结果：暂无数据`,
-      };
+    handler: async (params, ctx) => {
+      const query = String(params['query']);
+      const pageSize = String(params['limit'] ?? 15);
+      const profile = ctx?.profile ?? 'assistant';
+      const { success, output } = await execCli(profile, [
+        'docs', '+search',
+        '--query', query,
+        '--page-size', pageSize,
+      ]);
+      return { success, output };
     },
   });
 
@@ -549,7 +633,7 @@ function setupBuiltinTools(): void {
     requiresApproval: false,
     riskLevel: 'low',
     readOnly: true,
-    handler: async () => {
+    handler: async (_params, _ctx) => {
       return {
         success: true,
         output: '[stub] 暂无记忆数据',
@@ -566,7 +650,7 @@ function setupBuiltinTools(): void {
     requiresApproval: false,
     riskLevel: 'low',
     readOnly: true,
-    handler: async (params) => {
+    handler: async (params, _ctx) => {
       const query = String(params['query'] ?? '').toLowerCase();
       const matches = Object.entries(TOOL_REGISTRY)
         .filter(([name, def]) =>
@@ -594,17 +678,27 @@ function setupBuiltinTools(): void {
     name: 'request_human_approval',
     description: '请求人类审批某个操作',
     paramsSchema: {
+      chat_id: { schema: z.string(), description: '飞书群聊 ID（必填，用于发送审批通知）', required: true },
       action: { schema: z.string(), description: '需要审批的操作描述', required: true },
       reason: { schema: z.string().optional(), description: '为什么需要审批', required: false },
     },
     requiresApproval: true,
     riskLevel: 'high',
     readOnly: false,
-    handler: async (params) => {
-      return {
-        success: true,
-        output: `[stub] 已请求审批: ${params['action']}（等待人工确认）`,
-      };
+    handler: async (params, ctx) => {
+      const action = String(params['action']);
+      const reason = params['reason'] ? String(params['reason']) : '';
+      const profile = ctx?.profile ?? 'assistant';
+      // 审批请求通过 lark-cli 发送一条消息通知（后续可按真实审批流程改造）
+      const message = reason
+        ? `[审批请求] ${action}\n原因：${reason}\n请确认后回复。`
+        : `[审批请求] ${action}\n请确认后回复。`;
+      const { success, output } = await execCli(profile, [
+        'im', '+messages-send',
+        '--chat-id', String(params['chat_id'] ?? ''),
+        '--text', message,
+      ]);
+      return { success, output };
     },
   });
 }
@@ -623,7 +717,7 @@ function setupManagementTools(): void {
     requiresApproval: false,
     riskLevel: 'low',
     readOnly: true,
-    handler: async () => {
+    handler: async (_params, _ctx) => {
       if (!existsSync(AGENTS_DIR)) {
         return { success: true, output: '暂无 Agent。使用 create_agent 创建一个。' };
       }
@@ -657,7 +751,7 @@ function setupManagementTools(): void {
     requiresApproval: true,
     riskLevel: 'high',
     readOnly: false,
-    handler: async (params) => {
+    handler: async (params, _ctx) => {
       const name = String(params['name']);
       const description = String(params['description']);
       const voiceStyle = params['voiceStyle'] ? String(params['voiceStyle']) : '';
@@ -725,7 +819,7 @@ function setupManagementTools(): void {
     requiresApproval: false,
     riskLevel: 'medium',
     readOnly: false,
-    handler: async (params) => {
+    handler: async (params, _ctx) => {
       const agentId = String(params['agentId']);
       const filePath = join(AGENTS_DIR, `${agentId}.json`);
       if (!existsSync(filePath)) {
@@ -755,7 +849,7 @@ function setupManagementTools(): void {
     requiresApproval: true,
     riskLevel: 'high',
     readOnly: false,
-    handler: async (params) => {
+    handler: async (params, _ctx) => {
       const agentId = String(params['agentId']);
       if (agentId === 'assistant') {
         return { success: false, output: '不能删除默认助手。你可以用 edit_agent 修改它，或先创建一个新的 Agent 替代它。' };
@@ -781,7 +875,7 @@ function setupManagementTools(): void {
     requiresApproval: true,
     riskLevel: 'high',
     readOnly: false,
-    handler: async (params) => {
+    handler: async (params, _ctx) => {
       const agentId = String(params['agentId']);
       const filePath = join(AGENTS_DIR, `${agentId}.json`);
       if (!existsSync(filePath)) {
